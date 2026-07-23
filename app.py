@@ -1,4 +1,5 @@
 import os
+import re
 
 import fitz
 import faiss
@@ -375,6 +376,55 @@ def _lexical_score(question, text):
     return min(1.0, 0.65 * coverage + 0.25 * number_bonus + 0.10 * phrase_bonus)
 
 
+def _document_intent_score(question, filename, document_text=""):
+    """
+    Generic document-level routing score.
+    Uses the user's wording + filename/document hints without hard-coding
+    any specific uploaded filename.
+    """
+    q = _normalize_query_text(question)
+    name = _normalize_query_text(filename)
+    sample = _normalize_query_text(document_text[:5000])
+
+    score = 0.0
+
+    # Direct filename token overlap.
+    q_terms = set(_query_terms(question))
+    name_terms = set(_query_terms(filename))
+    if q_terms and name_terms:
+        score += 0.55 * (len(q_terms & name_terms) / len(q_terms))
+
+    # Generic document-type intent aliases.
+    intent_aliases = {
+        "resume": {"resume", "cv", "curriculum vitae", "skill", "skills", "experience", "project", "projects", "education"},
+        "result": {"result", "marks", "mark", "score", "semester", "sem", "sgpa", "cgpa", "grade", "grades"},
+        "certificate": {"certificate", "certification", "certified", "completion", "course"},
+        "research": {"research", "paper", "methodology", "finding", "findings", "abstract", "limitation", "limitations"},
+        "invoice": {"invoice", "bill", "amount", "payment", "total", "tax"},
+        "report": {"report", "analysis", "summary", "finding", "findings"},
+    }
+
+    for doc_type, aliases in intent_aliases.items():
+        query_hits = sum(1 for alias in aliases if alias in q)
+        if not query_hits:
+            continue
+
+        # Filename evidence is strongest.
+        if doc_type in name or any(alias in name for alias in aliases):
+            score += min(1.0, 0.35 + 0.10 * query_hits)
+
+        # Content evidence is weaker but useful for generic filenames.
+        if doc_type in sample or any(alias in sample for alias in aliases):
+            score += min(0.30, 0.08 * query_hits)
+
+    # Explicit phrase like "from resume", "in result", etc.
+    for phrase in ("resume", "cv", "result", "marksheet", "certificate", "research paper", "invoice", "report"):
+        if phrase in q and phrase in name:
+            score += 0.45
+
+    return min(score, 1.25)
+
+
 def retrieve_relevant_chunks(
     question,
     index,
@@ -383,17 +433,17 @@ def retrieve_relevant_chunks(
     similarity_threshold=0.30
 ):
     """
-    Hybrid retrieval:
-    - semantic similarity from MiniLM + FAISS
-    - lexical/exact-term matching for numbers, names and identifiers
-    - candidate reranking before context reaches the LLM
+    Document-aware hybrid RAG:
+    1. semantic retrieval
+    2. exact/keyword matching
+    3. document-level routing using filename/type intent
+    4. reranking of evidence
     """
 
     if index is None or not chunks:
         return []
 
-    # Retrieve a broader semantic candidate pool first.
-    candidate_k = min(max(top_k * 4, 12), len(chunks))
+    candidate_k = min(max(top_k * 5, 16), len(chunks))
 
     question_embedding = embedding_model.encode(
         [question],
@@ -401,57 +451,98 @@ def retrieve_relevant_chunks(
         normalize_embeddings=True
     ).astype("float32")
 
-    scores, indices = index.search(
-        question_embedding,
-        candidate_k
-    )
+    scores, indices = index.search(question_embedding, candidate_k)
 
     semantic_by_index = {}
     for score, idx in zip(scores[0], indices[0]):
         if idx >= 0:
             semantic_by_index[int(idx)] = float(score)
 
-    # Add strong lexical candidates even when FAISS misses them.
+    # Build document text samples for routing.
+    document_samples = {}
+    for chunk in chunks:
+        doc_name = chunk.get("document") or chunk.get("filename") or chunk.get("source") or "Unknown document"
+        document_samples.setdefault(doc_name, "")
+        if len(document_samples[doc_name]) < 5000:
+            document_samples[doc_name] += " " + chunk["text"]
+
+    document_scores = {
+        filename: _document_intent_score(question, filename, text)
+        for filename, text in document_samples.items()
+    }
+
     lexical_ranked = []
     for idx, chunk in enumerate(chunks):
         lexical = _lexical_score(question, chunk["text"])
         if lexical > 0:
             lexical_ranked.append((lexical, idx))
-
     lexical_ranked.sort(reverse=True)
+
     candidate_indices = set(semantic_by_index)
     candidate_indices.update(idx for _, idx in lexical_ranked[:candidate_k])
 
-    ranked = []
+    # If a document strongly matches the user's explicit intent, make sure
+    # its chunks enter the reranking pool even if FAISS initially missed them.
+    if document_scores:
+        best_doc_score = max(document_scores.values())
+        if best_doc_score >= 0.35:
+            strong_docs = {
+                name for name, score in document_scores.items()
+                if score >= max(0.35, best_doc_score - 0.15)
+            }
+            for idx, chunk in enumerate(chunks):
+                if (chunk.get("document") or chunk.get("filename") or chunk.get("source") or "Unknown document") in strong_docs:
+                    candidate_indices.add(idx)
 
+    ranked = []
     for idx in candidate_indices:
         chunk = chunks[idx]
         semantic = semantic_by_index.get(idx, 0.0)
         lexical = _lexical_score(question, chunk["text"])
+        doc_name = chunk.get("document") or chunk.get("filename") or chunk.get("source") or "Unknown document"
+        document_score = document_scores.get(doc_name, 0.0)
 
-        # Semantic remains primary; lexical evidence rescues exact-fact queries.
-        hybrid = (0.72 * max(semantic, 0.0)) + (0.28 * lexical)
-
-        ranked.append(
-            {
-                **chunk,
-                "score": semantic,
-                "semantic_score": semantic,
-                "lexical_score": lexical,
-                "hybrid_score": hybrid
-            }
+        # Document routing is deliberately meaningful but not absolute:
+        # a filename hint can steer retrieval, while chunk evidence still matters.
+        hybrid = (
+            0.55 * max(semantic, 0.0)
+            + 0.25 * lexical
+            + 0.20 * min(document_score, 1.0)
         )
+
+        ranked.append({
+            **chunk,
+            "score": semantic,
+            "semantic_score": semantic,
+            "lexical_score": lexical,
+            "document_score": document_score,
+            "hybrid_score": hybrid,
+        })
 
     ranked.sort(key=lambda item: item["hybrid_score"], reverse=True)
 
-    # Keep evidence if either semantic retrieval or exact-term evidence is useful.
     filtered = [
         item for item in ranked
         if item["semantic_score"] >= similarity_threshold
-        or item["lexical_score"] >= 0.34
+        or item["lexical_score"] >= 0.30
+        or item["document_score"] >= 0.35
     ]
 
-    return filtered[:top_k]
+    # Avoid one irrelevant document monopolizing evidence, while still allowing
+    # several chunks from the strongest matching document.
+    results = []
+    per_doc = {}
+    for item in filtered:
+        filename = item.get("document") or item.get("filename") or item.get("source") or "Unknown document"
+        limit = 3 if item["document_score"] >= 0.35 else 2
+        if per_doc.get(filename, 0) >= limit:
+            continue
+        results.append(item)
+        per_doc[filename] = per_doc.get(filename, 0) + 1
+        if len(results) >= top_k:
+            break
+
+    return results
 
 
 # =========================================================
@@ -1072,19 +1163,19 @@ with st.expander("Technical details", expanded=False):
     preview_tab, chunks_tab = st.tabs(["Extracted Text", "RAG Chunks"])
 
     with preview_tab:
-        for page in all_documents[:5]:
+        for preview_index, page in enumerate(all_documents[:5]):
             st.markdown(f"**{page['document']} — Page {page['page']}**")
             st.text_area(
                 "Extracted text",
                 value=page["text"][:2000],
                 height=170,
                 disabled=True,
-                key=f"preview_{page['document']}_{page['page']}",
+                key=f"preview_{preview_index}_{page['document']}_{page['page']}",
                 label_visibility="collapsed"
             )
 
     with chunks_tab:
-        for chunk in document_chunks[:5]:
+        for chunk_index, chunk in enumerate(document_chunks[:5]):
             st.markdown(
                 f"**{chunk['document']} — Page {chunk['page']} — Chunk {chunk['chunk']}**"
             )
@@ -1093,7 +1184,7 @@ with st.expander("Technical details", expanded=False):
                 value=chunk["text"],
                 height=150,
                 disabled=True,
-                key=f"chunk_{chunk['document']}_{chunk['page']}_{chunk['chunk']}",
+                key=f"chunk_{chunk_index}_{chunk['document']}_{chunk['page']}_{chunk['chunk']}",
                 label_visibility="collapsed"
             )
 
@@ -1271,7 +1362,12 @@ RULES:
                                     f"**Evidence {n} — {chunk['document']} — "
                                     f"Page {chunk['page']} — Chunk {chunk['chunk']}**"
                                 )
-                                st.caption(f"Hybrid relevance: {chunk.get('hybrid_score', chunk['score']):.3f}  •  Semantic: {chunk.get('semantic_score', chunk['score']):.3f}  •  Exact-term match: {chunk.get('lexical_score', 0.0):.3f}")
+                                st.caption(
+                        f"Hybrid: {chunk.get('hybrid_score', chunk['score']):.3f}  •  "
+                        f"Semantic: {chunk.get('semantic_score', chunk['score']):.3f}  •  "
+                        f"Exact terms: {chunk.get('lexical_score', 0.0):.3f}  •  "
+                        f"Document match: {chunk.get('document_score', 0.0):.3f}"
+                    )
                                 st.text_area(
                                     "Evidence",
                                     value=chunk["text"],
