@@ -23,9 +23,15 @@ st.markdown(
     <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    [data-testid="stToolbar"] {visibility: hidden; height: 0;}
     [data-testid="stDecoration"] {display: none;}
     .stAppDeployButton {display:none;}
+
+    /* Keep Streamlit's sidebar collapse/reopen control visible. */
+    [data-testid="stSidebarCollapsedControl"] {
+        display: flex !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+    }
     </style>
     """,
     unsafe_allow_html=True
