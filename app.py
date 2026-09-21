@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from typing import Dict, List, Optional, Tuple
 
 import faiss
@@ -279,6 +280,14 @@ MAX_FILE_MB = 25
 MAX_TOTAL_UPLOAD_MB = 75
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
+
+# Groq free/developer tiers can enforce token-per-minute limits.
+# Keep requests small and avoid accidental double-click bursts.
+MIN_REQUEST_INTERVAL_SECONDS = 3.0
+SUMMARY_MAX_CHARS = 18000
+COMPARE_MAX_CHARS = 24000
+ASK_MAX_CONTEXT_CHARS = 18000
+MAX_COMPLETION_TOKENS = 1200
 
 
 # =========================================================
@@ -883,6 +892,14 @@ def ask_llm(
         system_prompt = default_system_prompt
 
     try:
+        # Prevent rapid accidental duplicate requests from the Streamlit UI.
+        last_request_time = st.session_state.get("last_groq_request_time", 0.0)
+        elapsed = time.time() - last_request_time
+        if elapsed < MIN_REQUEST_INTERVAL_SECONDS:
+            time.sleep(MIN_REQUEST_INTERVAL_SECONDS - elapsed)
+
+        st.session_state["last_groq_request_time"] = time.time()
+
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
@@ -896,6 +913,8 @@ def ask_llm(
                 },
             ],
             temperature=0.2,
+            max_completion_tokens=MAX_COMPLETION_TOKENS,
+            reasoning_effort="low",
         )
 
         if not response.choices:
@@ -926,7 +945,9 @@ def ask_llm(
             )
         elif "429" in error_text or "rate" in error_text.lower():
             st.error(
-                "Groq rate limit reached. Please wait and try again."
+                "Groq rate limit reached. Wait about 10–20 seconds "
+                "before trying again. The app already limits request size "
+                "and prevents rapid duplicate requests."
             )
         else:
             st.error(f"LLM Error: {exc}")
@@ -968,7 +989,7 @@ def summarize_document(
 
     document_text = limit_text(
         document_text,
-        45000,
+        SUMMARY_MAX_CHARS,
     )
 
     prompt = f"""
@@ -1025,7 +1046,7 @@ def compare_documents(
     for document_name, pages in grouped_documents.items():
         document_text = limit_text(
             "\n".join(pages),
-            30000,
+            12000,
         )
 
         comparison_context += (
@@ -1037,7 +1058,7 @@ def compare_documents(
 
     comparison_context = limit_text(
         comparison_context,
-        90000,
+        COMPARE_MAX_CHARS,
     )
 
     prompt = f"""
@@ -1725,6 +1746,11 @@ with ask_tab:
                             f"CONTENT:\n{chunk['text']}"
                         )
                         for chunk in relevant_chunks
+                    )
+
+                    context = limit_text(
+                        context,
+                        ASK_MAX_CONTEXT_CHARS,
                     )
 
                     rag_prompt = f"""
