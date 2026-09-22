@@ -42,7 +42,7 @@ Document-Aware Retrieval
     ↓
 Relevant Evidence
     ↓
-Llama 3.3 70B
+openai/gpt-oss-120b
     ↓
 Grounded Answer + Sources
 ```
