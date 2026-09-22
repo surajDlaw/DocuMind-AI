@@ -20,7 +20,7 @@ DocuMind AI allows users to upload multiple PDF documents, generate summaries, c
 - **Python**
 - **Streamlit**
 - **Groq API**
-- **Llama 3.3 70B**
+- **model="openai/gpt-oss-120b"*
 - **Sentence Transformers / MiniLM**
 - **FAISS**
 - **PyMuPDF**
